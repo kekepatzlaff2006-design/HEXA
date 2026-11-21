@@ -144,7 +144,7 @@ internal fun LibraryRoot(
         }
     }
 
-    if (showAddGames.value) {
+    val pickGame = rememberHexaGamePicker(activity); LaunchedEffect(showAddGames.value) { if (showAddGames.value) { showAddGames.value = false; pickGame() } }; if (false) {
         ModalBottomSheet(
             onDismissRequest = { showAddGames.value = false },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
