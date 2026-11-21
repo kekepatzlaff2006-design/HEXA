@@ -1,0 +1,109 @@
+name: HEXA APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "5.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hexa-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Apply HEXA branding
+        run: |
+          pip install --quiet --break-system-packages pillow || pip install --quiet pillow
+          python3 .github/hexa/brand.py
+
+      - name: Signing key (kept in a private draft release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/hexa-signing"
+          mkdir -p "$dir"
+          if gh release view hexa-signing --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download hexa-signing --repo "$GITHUB_REPOSITORY" --dir "$dir" --pattern upstream.p12 --pattern password.txt
+          else
+            pass=$(openssl rand -hex 24)
+            echo "::add-mask::$pass"
+            keytool -genkeypair -noprompt -storetype PKCS12 -keystore "$dir/upstream.p12" \
+              -alias upstream -keyalg RSA -keysize 3072 -validity 10000 \
+              -dname 'CN=HEXA' -storepass "$pass" -keypass "$pass"
+            printf '%s' "$pass" > "$dir/password.txt"
+            gh release create hexa-signing --repo "$GITHUB_REPOSITORY" --draft \
+              --title 'HEXA signing key - do not publish' \
+              --notes 'Private signing key for HEXA updates. Keep as draft, do not delete.' \
+              "$dir/upstream.p12" "$dir/password.txt"
+          fi
+          pass=$(cat "$dir/password.txt")
+          echo "::add-mask::$pass"
+          echo "LUDASHI_KEYSTORE_PATH=$dir/upstream.p12" >> "$GITHUB_ENV"
+          echo "LUDASHI_STORE_PASSWORD=$pass" >> "$GITHUB_ENV"
+
+      - name: Native tools
+        run: bash .github/scripts/prepare-native-tools.sh
+
+      - name: Vulkan validation layer
+        run: |
+          set -euo pipefail
+          V="1.4.357.0"
+          A="$RUNNER_TEMP/vvl.tar.gz"
+          curl --retry 3 -fL "https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/download/vulkan-sdk-$V/android-binaries-$V.tar.gz" -o "$A"
+          echo "daaeac9291167a2d5257a8a0f7c0a86e56d0821d0211af661710fe68c8040ffa  $A" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/vvl" && tar -xzf "$A" -C "$RUNNER_TEMP/vvl"
+          L="$(find "$RUNNER_TEMP/vvl" -type f -path '*/arm64-v8a/libVkLayer_khronos_validation.so' -print -quit)"
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp "$L" app/src/main/jniLibs/arm64-v8a/
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Steam launcher
+        run: bash .github/scripts/prepare-steam-launcher.sh
+
+      - name: Gradle
+        run: bash .github/scripts/prepare-gradle.sh
+
+      - name: Build APK
+        run: >-
+          bash gradlew assembleRelease --no-daemon --max-workers=2
+          -Dorg.gradle.jvmargs="-Xmx3072m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+          -Pkotlin.compiler.execution.strategy=in-process
+          --no-configuration-cache --stacktrace
+
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          apk="$RUNNER_TEMP/HEXA-${{ github.run_number }}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$apk"
+          gh release create "build-${{ github.run_number }}" "$apk" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --latest \
+            --title "HEXA build ${{ github.run_number }}" \
+            --notes "APK do HEXA. Baixe o arquivo HEXA-${{ github.run_number }}.apk abaixo e instale no celular."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HEXA-${{ github.run_number }}
+          path: app/build/outputs/apk/release/app-release.apk
